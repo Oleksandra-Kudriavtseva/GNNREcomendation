@@ -1,76 +1,260 @@
 import pandas as pd
+import json
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import dgl
 import dgl.nn as dglnn
-from sklearn.preprocessing import LabelEncoder
 
-#дані (тільки айді користувачів та фільмів і оцінки)
-ratings = pd.read_csv("data/ratings.csv")
-ratings = ratings.head(20000)
+moviesGenre = pd.read_csv("movies.csv")
+movieRatings = pd.read_csv("small_movie_user_rating.csv", nrows=500)
+
+booksGenre = []
+with open("goodreads_book_genres_initial.json", "r", encoding="utf-8") as f:
+    for line in f:
+        booksGenre.append(json.loads(line))
+
+bookRatings = pd.read_csv("small_book_user_rating.csv", nrows=500)
+games = pd.read_csv("vgsales.csv")
+games = games.reset_index()
+games.rename(columns={"index": "gameId"}, inplace=True)
+
+numFakeUsers = 50
+fakeGameRatings = []
+gameIdsList = games["gameId"].values
+for u in range(numFakeUsers):
+    for _ in range(random.randint(5, 15)):
+        game = random.choice(gameIdsList)
+        rating = random.uniform(0.0, 5.0)
+        fakeGameRatings.append((u, game, rating))
+
+gameRatings = pd.DataFrame(fakeGameRatings, columns=["userId", "gameId", "rating"])
+
+userIds = (
+    set(movieRatings["userId"].unique())
+    | set(bookRatings["user_id"].unique())
+    | set(gameRatings["userId"].unique())
+)
+
+movieIds = set(moviesGenre["movieId"].unique())
+bookIds = set(bookRatings["book_id"].unique())
+gameIds = set(games["gameId"].unique())
+
+userMap = {id_: i for i, id_ in enumerate(sorted(userIds))}
+movieMap = {id_: i for i, id_ in enumerate(sorted(movieIds))}
+bookMap = {id_: i for i, id_ in enumerate(sorted(bookIds))}
+gameMap = {id_: i for i, id_ in enumerate(sorted(gameIds))}
+
+allGenres = set()
+
+movieGenres = {}
+for _, row in moviesGenre.iterrows():
+    genres = row["genres"].split("|")
+    movieGenres[row["movieId"]] = genres
+    allGenres.update(genres)
+
+bookGenres = {}
+for b in booksGenre:
+    bookId = int(b["book_id"])
+    if bookId in bookIds:
+        genres = list(b["genres"].keys())
+        bookGenres[bookId] = genres
+        allGenres.update(genres)
+
+gameGenres = {}
+for _, row in games.iterrows():
+    if pd.notna(row["Genre"]):
+        genre = row["Genre"].strip()
+        gameGenres[row["gameId"]] = [genre]
+        allGenres.add(genre)
+
+genreMap = {g: i for i, g in enumerate(allGenres)}
+
+edges = {}
+
+userMovieSrc, userMovieDst = [], []
+for _, row in movieRatings.iterrows():
+    if row["movieId"] in movieMap:
+        userMovieSrc.append(userMap[row["userId"]])
+        userMovieDst.append(movieMap[row["movieId"]])
+edges[('user', 'ratesMovie', 'movie')] = (torch.tensor(userMovieSrc), torch.tensor(userMovieDst))
+
+userBookSrc, userBookDst = [], []
+for _, row in bookRatings.iterrows():
+    if row["book_id"] in bookMap:
+        userBookSrc.append(userMap[row["user_id"]])
+        userBookDst.append(bookMap[row["book_id"]])
+edges[('user', 'ratesBook', 'book')] = (torch.tensor(userBookSrc), torch.tensor(userBookDst))
+
+userGameSrc, userGameDst = [], []
+for _, row in gameRatings.iterrows():
+    if row["gameId"] in gameMap:
+        userGameSrc.append(userMap[row["userId"]])
+        userGameDst.append(gameMap[row["gameId"]])
+edges[('user', 'ratesGame', 'game')] = (torch.tensor(userGameSrc), torch.tensor(userGameDst))
+
+def addGenreEdges(itemGenres, itemMap, edgeName, nodeType):
+    src, dst = [], []
+    for itemId, genres in itemGenres.items():
+        if itemId in itemMap:
+            for g in genres:
+                src.append(itemMap[itemId])
+                dst.append(genreMap[g])
+    edges[(nodeType, edgeName, 'genre')] = (torch.tensor(src), torch.tensor(dst))
+
+addGenreEdges(movieGenres, movieMap, 'hasGenre', 'movie')
+addGenreEdges(bookGenres, bookMap, 'hasGenre', 'book')
+addGenreEdges(gameGenres, gameMap, 'hasGenre', 'game')
+
+g = dgl.heterograph(edges)
+print(g)
 
 
-user_encoder = LabelEncoder()
-movie_encoder = LabelEncoder()
+trainUsers, trainItems, trainTypes, trainRatings = [], [], [], []
 
-ratings["user"] = user_encoder.fit_transform(ratings["userId"])
-ratings["movie"] = movie_encoder.fit_transform(ratings["movieId"])
+def addTrainingSamples(ratingsDf, userCol, itemCol, itemMap, itemType):
+    for _, row in ratingsDf.iterrows():
+        if row[itemCol] in itemMap:
+            trainUsers.append(userMap[row[userCol]])
+            trainItems.append(itemMap[row[itemCol]])
+            trainTypes.append(itemType)
+            trainRatings.append(float(row["rating"]))
 
-num_users = ratings["user"].nunique()
-num_movies = ratings["movie"].nunique()
+addTrainingSamples(movieRatings, 'userId', 'movieId', movieMap, 'movie')
+addTrainingSamples(bookRatings, 'user_id', 'book_id', bookMap, 'book')
+addTrainingSamples(gameRatings, 'userId', 'gameId', gameMap, 'game')
 
-ratings["movie"] = ratings["movie"] + num_users
+trainUsers = torch.tensor(trainUsers)
+trainItems = torch.tensor(trainItems)
+trainRatings = torch.tensor(trainRatings, dtype=torch.float32)
 
-src = torch.tensor(ratings["user"].values)
-dst = torch.tensor(ratings["movie"].values)
+hiddenDim = 32
+for nodeType in g.ntypes:
+    g.nodes[nodeType].data['feat'] = torch.randn(g.num_nodes(nodeType), hiddenDim)
 
-graph = dgl.graph((src, dst))
-graph = dgl.add_self_loop(graph)
-
-num_nodes = num_users + num_movies
-
-
-features = torch.randn(num_nodes, 16)
-
-labels = torch.tensor(ratings["rating"].values, dtype=torch.float32)
-
-
-
-
-#тут для GCN, бо він простіший, але коли буде більше типів вузлів буду використовувати R GCN
-class GCN(nn.Module):
-    def __init__(self, in_feats, hidden, out_feats):
+class HeteroGNN(nn.Module):
+    def __init__(self, hiddenDim, relationNames, ntypes):
         super().__init__()
-        self.conv1 = dglnn.GraphConv(in_feats, hidden)
-        self.conv2 = dglnn.GraphConv(hidden, out_feats)
+        self.ntypes = ntypes
+        self.conv1 = dglnn.HeteroGraphConv(
+            {rel: dglnn.SAGEConv(hiddenDim, hiddenDim, 'mean') for rel in relationNames},
+            aggregate='sum'
+        )
+        self.conv2 = dglnn.HeteroGraphConv(
+            {rel: dglnn.SAGEConv(hiddenDim, hiddenDim, 'mean') for rel in relationNames},
+            aggregate='sum'
+        )
 
-    def forward(self, g, x):
-        x = self.conv1(g, x)
-        x = F.relu(x)
-        x = self.conv2(g, x)
-        return x
+    def forward(self, graph, features):
+        h = self.conv1(graph, features)
+        h = {k: F.relu(v) for k, v in h.items()}
+        h = self.conv2(graph, h)
+        for nt in self.ntypes:
+            if nt not in h:
+                h[nt] = features[nt]
+        return h
 
-model = GCN(16, 32, 16)
+class RatingPredictor(nn.Module):
+    def __init__(self, hiddenDim):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(hiddenDim * 2, hiddenDim),
+            nn.ReLU(),
+            nn.Linear(hiddenDim, 1)
+        )
 
-optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-loss_fn = nn.MSELoss()
+    def forward(self, userEmb, itemEmb):
+        x = torch.cat([userEmb, itemEmb], dim=1)
+        return self.mlp(x).squeeze()
 
+gnn = HeteroGNN(hiddenDim, g.etypes, g.ntypes)
+predictor = RatingPredictor(hiddenDim)
 
-for epoch in range(30):
-    model.train()
-    node_embeddings = model(graph, features)
+optimizer = torch.optim.Adam(list(gnn.parameters()) + list(predictor.parameters()), lr=0.01)
 
+for epoch in range(50):
+    gnn.train()
+    predictor.train()
 
-    user_emb = node_embeddings[src]
-    movie_emb = node_embeddings[dst]
+    embeddings = gnn(g, {nt: g.nodes[nt].data['feat'] for nt in g.ntypes})
 
+    userEmbList, itemEmbList = [], []
+    for i in range(len(trainUsers)):
+        userEmb = embeddings['user'][trainUsers[i]]
+        itemEmb = embeddings[trainTypes[i]][trainItems[i]]
+        userEmbList.append(userEmb)
+        itemEmbList.append(itemEmb)
 
-    preds = (user_emb * movie_emb).sum(dim=1)
-    loss = loss_fn(preds, labels)
+    userEmbTensor = torch.stack(userEmbList)
+    itemEmbTensor = torch.stack(itemEmbList)
+
+    predictions = predictor(userEmbTensor, itemEmbTensor)
+    loss = F.mse_loss(predictions, trainRatings)
 
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-    print(f"ітерація {epoch+1}, похибка: {loss.item():.4f}")
+    if epoch % 10 == 0:
+        print(f"Epoch {epoch}, Loss: {loss:.4f}")
+
+#збереження
+torch.save(gnn.state_dict(), "gnn_model.pth")
+torch.save(predictor.state_dict(), "predictor_model.pth")
+
+
+
+gnn.load_state_dict(torch.load("gnn_model.pth", map_location=torch.device('cpu')))
+predictor.load_state_dict(torch.load("predictor_model.pth", map_location=torch.device('cpu')))
+gnn.eval()
+predictor.eval()
+
+
+
+
+
+
+
+
+
+#рекомендація
+def recommend_for_user(user_id, top_k=3):
+    if user_id not in userMap:
+        return {"error": "User not found"}
+
+    with torch.no_grad():
+        embeddings = gnn(g, {nt: g.nodes[nt].data['feat'] for nt in g.ntypes})
+
+        user_idx = userMap[user_id]
+        user_emb = embeddings['user'][user_idx]
+
+        recommendations = {}
+
+        for item_type, item_map in [('movie', movieMap),
+                                    ('book', bookMap),
+                                    ('game', gameMap)]:
+
+            scores = []
+            for original_id, mapped_id in item_map.items():
+                item_emb = embeddings[item_type][mapped_id]
+                score = predictor(
+                    user_emb.unsqueeze(0),
+                    item_emb.unsqueeze(0)
+                ).item()
+
+                scores.append((int(original_id), float(score)))
+
+            scores.sort(key=lambda x: x[1], reverse=True)
+            recommendations[item_type] = scores[:top_k]
+
+        return recommendations
+
+
+
+
+
+
+
+
+print(recommend_for_user(0))
